@@ -24,6 +24,7 @@ import cv2
 import numpy as np
 import sys
 import os
+import json
 from datetime import datetime
 
 
@@ -48,12 +49,117 @@ COR_HSV_MAX = np.array([85, 255, 255])
 CASCADE_FACE = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
 CASCADE_EYE  = cv2.data.haarcascades + "haarcascade_eye.xml"
 
+# Estrutura para base de referência e saída de estatísticas
+DATASET_DIR = "dataset"
+FACES_DIR = os.path.join(DATASET_DIR, "faces")
+OBJECTS_DIR = os.path.join(DATASET_DIR, "objects")
+STATS_JSON = "detecoes_stats.json"
+
+
+def criar_estrutura_dataset() -> None:
+    """Cria pastas para imagens de referência de faces e objetos."""
+    os.makedirs(FACES_DIR, exist_ok=True)
+    os.makedirs(OBJECTS_DIR, exist_ok=True)
+
+
+def _eh_imagem(nome_arquivo: str) -> bool:
+    return nome_arquivo.lower().endswith((".png", ".jpg", ".jpeg", ".bmp", ".webp"))
+
+
+def carregar_referencias(caminho_pasta: str,
+                         orb: cv2.ORB,
+                         max_largura: int = 320) -> list[dict]:
+    """
+    Carrega imagens de referência e extrai descritores ORB para matching.
+
+    O nome do arquivo (sem extensão) vira o rótulo exibido na detecção.
+    """
+    referencias = []
+    if not os.path.isdir(caminho_pasta):
+        return referencias
+
+    for nome in sorted(os.listdir(caminho_pasta)):
+        if not _eh_imagem(nome):
+            continue
+
+        caminho = os.path.join(caminho_pasta, nome)
+        imagem = cv2.imread(caminho)
+        if imagem is None:
+            continue
+
+        if imagem.shape[1] > max_largura:
+            escala = max_largura / float(imagem.shape[1])
+            nova_altura = int(imagem.shape[0] * escala)
+            imagem = cv2.resize(imagem, (max_largura, nova_altura))
+
+        cinza = cv2.cvtColor(imagem, cv2.COLOR_BGR2GRAY)
+        keypoints, descritores = orb.detectAndCompute(cinza, None)
+        if descritores is None or len(keypoints) < 10:
+            continue
+
+        rotulo = os.path.splitext(nome)[0]
+        referencias.append({
+            "rotulo": rotulo,
+            "descritores": descritores,
+        })
+
+    return referencias
+
+
+def reconhecer_por_referencia(imagem_bgr: np.ndarray,
+                              referencias: list[dict],
+                              orb: cv2.ORB,
+                              bf: cv2.BFMatcher,
+                              min_corresp: int = 12) -> str | None:
+    """Retorna o rótulo mais provável com ORB+BFMatcher, se houver confiança."""
+    if not referencias or imagem_bgr.size == 0:
+        return None
+
+    cinza = cv2.cvtColor(imagem_bgr, cv2.COLOR_BGR2GRAY)
+    keypoints, descritores = orb.detectAndCompute(cinza, None)
+    if descritores is None or len(keypoints) < 10:
+        return None
+
+    melhor_rotulo = None
+    melhor_score = 0
+
+    for ref in referencias:
+        pares = bf.knnMatch(ref["descritores"], descritores, k=2)
+        bons = []
+        for par in pares:
+            if len(par) < 2:
+                continue
+            m, n = par
+            if m.distance < 0.75 * n.distance:
+                bons.append(m)
+
+        score = len(bons)
+        if score > melhor_score:
+            melhor_score = score
+            melhor_rotulo = ref["rotulo"]
+
+    if melhor_score >= min_corresp:
+        return melhor_rotulo
+
+    return None
+
+
+def salvar_estatisticas_json(stats: dict, caminho: str = STATS_JSON) -> None:
+    """Persiste as estatísticas de detecção em arquivo JSON legível."""
+    with open(caminho, "w", encoding="utf-8") as f:
+        json.dump(stats, f, ensure_ascii=False, indent=2)
+
+
+def incrementar_contador(mapa: dict, chave: str, valor: int = 1) -> None:
+    """Incrementa uma chave de contagem em dicionário simples."""
+    mapa[chave] = mapa.get(chave, 0) + valor
+
 
 # =============================================================================
 # Modo 1 — Detecção por cores (HSV)
 # =============================================================================
 
-def detectar_cores(frame: np.ndarray) -> np.ndarray:
+def detectar_cores(frame: np.ndarray) -> tuple[np.ndarray, int]:
     """
     Detecta objetos de uma cor específica usando o espaço de cores HSV.
 
@@ -111,14 +217,18 @@ def detectar_cores(frame: np.ndarray) -> np.ndarray:
     cv2.putText(resultado, "Mascara HSV", (7, mini_h + 16),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
 
-    return resultado
+    total_objetos = sum(1 for cnt in contornos if cv2.contourArea(cnt) > 500)
+    return resultado, total_objetos
 
 
 # =============================================================================
 # Modo 2 — Detecção de formas geométricas
 # =============================================================================
 
-def detectar_formas(frame: np.ndarray) -> np.ndarray:
+def detectar_formas(frame: np.ndarray,
+                   referencias_objetos: list[dict],
+                   orb: cv2.ORB,
+                   bf: cv2.BFMatcher) -> tuple[np.ndarray, list[str], list[str]]:
     """
     Detecta e classifica formas geométricas (triângulo, quadrado, retângulo,
     pentágono, hexágono, círculo) usando aproximação de contornos.
@@ -146,6 +256,9 @@ def detectar_formas(frame: np.ndarray) -> np.ndarray:
 
     # Encontrar todos os contornos externos na imagem limiarizada
     contornos, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    formas_detectadas = []
+    objetos_reconhecidos = []
 
     for cnt in contornos:
         area = cv2.contourArea(cnt)
@@ -178,6 +291,8 @@ def detectar_formas(frame: np.ndarray) -> np.ndarray:
             # Muitos vértices → provavelmente um círculo
             nome, cor = "Circulo", (0, 255, 0)
 
+        formas_detectadas.append(nome)
+
         # Desenhar o contorno e o rótulo
         cv2.drawContours(resultado, [approx], -1, cor, 2)
         M = cv2.moments(cnt)
@@ -187,7 +302,16 @@ def detectar_formas(frame: np.ndarray) -> np.ndarray:
             cv2.putText(resultado, nome, (cx - 40, cy),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, cor, 2)
 
-    return resultado
+        # Tenta reconhecer objeto pela ROI da forma detectada
+        x, y, w, h = cv2.boundingRect(approx)
+        roi = frame[y:y + h, x:x + w]
+        rotulo_obj = reconhecer_por_referencia(roi, referencias_objetos, orb, bf, min_corresp=10)
+        if rotulo_obj:
+            objetos_reconhecidos.append(rotulo_obj)
+            cv2.putText(resultado, f"Objeto: {rotulo_obj}", (x, y + h + 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+
+    return resultado, formas_detectadas, objetos_reconhecidos
 
 
 # =============================================================================
@@ -196,7 +320,10 @@ def detectar_formas(frame: np.ndarray) -> np.ndarray:
 
 def detectar_faces(frame: np.ndarray,
                    detector_face: cv2.CascadeClassifier,
-                   detector_olho: cv2.CascadeClassifier) -> np.ndarray:
+                   detector_olho: cv2.CascadeClassifier,
+                   referencias_faces: list[dict],
+                   orb: cv2.ORB,
+                   bf: cv2.BFMatcher) -> tuple[np.ndarray, int, int, list[str]]:
     """
     Detecta faces humanas e olhos usando classificadores Haar Cascade.
 
@@ -230,11 +357,22 @@ def detectar_faces(frame: np.ndarray,
         flags=cv2.CASCADE_SCALE_IMAGE
     )
 
+    total_olhos = 0
+    pessoas_reconhecidas = []
+
     for (fx, fy, fw, fh) in faces:
         # Desenhar retângulo ao redor da face
         cv2.rectangle(resultado, (fx, fy), (fx + fw, fy + fh), (255, 100, 0), 2)
-        cv2.putText(resultado, "Face", (fx, fy - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 100, 0), 2)
+        roi_face_color = resultado[fy:fy + fh, fx:fx + fw]
+        rotulo_pessoa = reconhecer_por_referencia(roi_face_color, referencias_faces, orb, bf, min_corresp=12)
+        if rotulo_pessoa:
+            pessoas_reconhecidas.append(rotulo_pessoa)
+            texto_face = f"Face: {rotulo_pessoa}"
+        else:
+            texto_face = "Face"
+
+        cv2.putText(resultado, texto_face, (fx, fy - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 100, 0), 2)
 
         # Buscar olhos somente dentro da região da face (ROI)
         roi_cinza = cinza[fy:fy + fh, fx:fx + fw]
@@ -251,19 +389,20 @@ def detectar_faces(frame: np.ndarray,
             cv2.rectangle(roi_color, (ex, ey), (ex + ew, ey + eh), (0, 220, 0), 2)
             cv2.putText(roi_color, "Olho", (ex, ey - 4),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 220, 0), 1)
+            total_olhos += 1
 
     # Mostrar contagem de faces detectadas
     cv2.putText(resultado, f"Faces: {len(faces)}", (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 100, 0), 2)
 
-    return resultado
+    return resultado, len(faces), total_olhos, pessoas_reconhecidas
 
 
 # =============================================================================
 # Modo 4 — Detecção de contornos gerais (Canny)
 # =============================================================================
 
-def detectar_contornos(frame: np.ndarray) -> np.ndarray:
+def detectar_contornos(frame: np.ndarray) -> tuple[np.ndarray, int]:
     """
     Detecta e exibe todos os contornos da cena usando o algoritmo de Canny.
 
@@ -323,7 +462,7 @@ def detectar_contornos(frame: np.ndarray) -> np.ndarray:
     cv2.putText(resultado, f"Contornos: {total}", (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
 
-    return resultado
+    return resultado, total
 
 
 # =============================================================================
@@ -422,6 +561,39 @@ def main():
     Abre a câmera ou arquivo de vídeo, entra no loop principal de captura
     de frames e chama a função de detecção correspondente ao modo ativo.
     """
+    # --- Preparar estrutura de referência e estatísticas ---
+    criar_estrutura_dataset()
+    orb = cv2.ORB_create(nfeatures=1200)
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+
+    referencias_faces = carregar_referencias(FACES_DIR, orb)
+    referencias_objetos = carregar_referencias(OBJECTS_DIR, orb)
+
+    stats = {
+        "inicio": datetime.now().isoformat(timespec="seconds"),
+        "frames_total": 0,
+        "modo_frames": {"1": 0, "2": 0, "3": 0, "4": 0},
+        "cores_objetos_total": 0,
+        "contornos_total": 0,
+        "faces_total": 0,
+        "olhos_total": 0,
+        "formas_total": 0,
+        "formas_por_tipo": {},
+        "pessoas_reconhecidas": {},
+        "objetos_reconhecidos": {},
+        "screenshots_salvos": 0,
+        "referencias_carregadas": {
+            "faces": len(referencias_faces),
+            "objetos": len(referencias_objetos),
+        },
+        "saida_json": STATS_JSON,
+    }
+
+    print(f"[INFO] Pasta de faces: {FACES_DIR}")
+    print(f"[INFO] Pasta de objetos: {OBJECTS_DIR}")
+    print(f"[INFO] Faces de referência carregadas: {len(referencias_faces)}")
+    print(f"[INFO] Objetos de referência carregados: {len(referencias_objetos)}")
+
     # --- Carregar fonte de vídeo ---
     if len(sys.argv) > 1:
         entrada = sys.argv[1]
@@ -471,9 +643,11 @@ def main():
     print("  Detecção de Objetos com OpenCV — Educacional")
     print("="*50)
     print("  Teclas: 1-4 (modo)  |  S (screenshot)  |  Q (sair)")
+    print(f"  Estatísticas JSON: {STATS_JSON}")
     print("="*50 + "\n")
 
     # --- Loop principal ---
+    frame_idx = 0
     while True:
         ret, frame = cap.read()
 
@@ -498,18 +672,41 @@ def main():
         # --- Processar frame conforme o modo ativo ---
         try:
             if modo_atual == 1:
-                frame_proc = detectar_cores(frame)
+                frame_proc, total_obj_cores = detectar_cores(frame)
+                stats["cores_objetos_total"] += total_obj_cores
             elif modo_atual == 2:
-                frame_proc = detectar_formas(frame)
+                frame_proc, formas_detectadas, objetos_reconhecidos = detectar_formas(
+                    frame, referencias_objetos, orb, bf
+                )
+                stats["formas_total"] += len(formas_detectadas)
+                for nome_forma in formas_detectadas:
+                    incrementar_contador(stats["formas_por_tipo"], nome_forma)
+                for obj in objetos_reconhecidos:
+                    incrementar_contador(stats["objetos_reconhecidos"], obj)
             elif modo_atual == 3:
-                frame_proc = detectar_faces(frame, detector_face, detector_olho)
+                frame_proc, qtd_faces, qtd_olhos, pessoas_reconhecidas = detectar_faces(
+                    frame, detector_face, detector_olho, referencias_faces, orb, bf
+                )
+                stats["faces_total"] += qtd_faces
+                stats["olhos_total"] += qtd_olhos
+                for pessoa in pessoas_reconhecidas:
+                    incrementar_contador(stats["pessoas_reconhecidas"], pessoa)
             else:
-                frame_proc = detectar_contornos(frame)
+                frame_proc, total_contornos = detectar_contornos(frame)
+                stats["contornos_total"] += total_contornos
         except Exception as e:
             # Em caso de erro no processamento, exibir frame original com aviso
             frame_proc = frame.copy()
             cv2.putText(frame_proc, f"Erro: {str(e)[:60]}", (10, 60),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+
+        stats["frames_total"] += 1
+        stats["modo_frames"][str(modo_atual)] += 1
+        frame_idx += 1
+
+        # Salva snapshot parcial a cada 60 frames
+        if frame_idx % 60 == 0:
+            salvar_estatisticas_json(stats)
 
         # --- Desenhar painel HUD ---
         frame_final = desenhar_painel(frame_proc, modo_atual, fps)
@@ -541,11 +738,16 @@ def main():
             nome_arquivo = f"screenshot_{ts}_{screenshot_n:03d}.png"
             cv2.imwrite(nome_arquivo, frame_final)
             screenshot_n += 1
+            stats["screenshots_salvos"] += 1
             print(f"[INFO] Screenshot salvo: {nome_arquivo}")
 
     # --- Limpeza ---
+    stats["fim"] = datetime.now().isoformat(timespec="seconds")
+    salvar_estatisticas_json(stats)
+
     cap.release()
     cv2.destroyAllWindows()
+    print(f"[INFO] Estatísticas salvas em: {STATS_JSON}")
     print("[INFO] Recursos liberados. Até mais!")
 
 

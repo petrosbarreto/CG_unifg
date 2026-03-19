@@ -1,0 +1,28 @@
+{
+  "inicio": "2026-03-19T20:25:02",
+  "frames_total": 518,
+  "modo_frames": {
+    "1": 190,
+    "2": 0,
+    "3": 328,
+    "4": 0
+  },
+  "cores_objetos_total": 2,
+  "contornos_total": 0,
+  "faces_total": 681,
+  "olhos_total": 162,
+  "formas_total": 0,
+  "formas_por_tipo": {},
+  "pessoas_reconhecidas": {
+    "lazaro2": 20,
+    "lazaro1": 26
+  },
+  "objetos_reconhecidos": {},
+  "screenshots_salvos": 1,
+  "referencias_carregadas": {
+    "faces": 2,
+    "objetos": 0
+  },
+  "saida_json": "detecoes_stats.json",
+  "fim": "2026-03-19T20:25:54"
+}
